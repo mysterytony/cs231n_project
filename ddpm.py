@@ -10,8 +10,8 @@ from typing import Optional, Tuple, Union, List
 
 ENABLE_CLASS_EMBEDDING = True
 
+
 def gather(consts: torch.Tensor, t: torch.Tensor):
-    """Gather consts for $t$ and reshape to feature map shape"""
     c = consts.gather(-1, t)
     return c.reshape(-1, 1, 1, 1)
 
@@ -34,6 +34,7 @@ class TimeEmbedding(nn.Module):
         emb = self.lin2(emb)
         return emb
 
+
 class ClassEmbedding(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         """
@@ -54,22 +55,8 @@ class ClassEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """
-    ### Residual block
-
-    A residual block has two convolution layers with group normalization.
-    Each resolution is processed with two residual blocks.
-    """
-
     def __init__(self, in_channels: int, out_channels: int, time_channels: int,
                  n_groups: int = 32, dropout: float = 0.1):
-        """
-        * `in_channels` is the number of input channels
-        * `out_channels` is the number of input channels
-        * `time_channels` is the number channels in the time step ($t$) embeddings
-        * `n_groups` is the number of groups for [group normalization](../../normalization/group_norm/index.html)
-        * `dropout` is the dropout rate
-        """
         super().__init__()
         # Group normalization and the first convolution layer
         self.norm1 = nn.GroupNorm(n_groups, in_channels)
@@ -102,11 +89,6 @@ class ResidualBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, c):
-        """
-        * `x` has shape `[batch_size, in_channels, height, width]`
-        * `t` has shape `[batch_size, time_channels]`
-        """
-
         h = self.conv1(self.act1(self.norm1(x)))
 
         if ENABLE_CLASS_EMBEDDING:
@@ -122,83 +104,35 @@ class ResidualBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """
-    ### Attention block
-
-    This is similar to [transformer multi-head attention](../../transformers/mha.html).
-    """
-
     def __init__(self, n_channels: int, n_heads: int = 1, d_k: int = None, n_groups: int = 32):
-        """
-        * `n_channels` is the number of channels in the input
-        * `n_heads` is the number of heads in multi-head attention
-        * `d_k` is the number of dimensions in each head
-        * `n_groups` is the number of groups for [group normalization](../../normalization/group_norm/index.html)
-        """
         super().__init__()
-
-        # Default `d_k`
         if d_k is None:
             d_k = n_channels
-        # Normalization layer
         self.norm = nn.GroupNorm(n_groups, n_channels)
-        # Projections for query, key and values
         self.projection = nn.Linear(n_channels, n_heads * d_k * 3)
-        # Linear layer for final transformation
         self.output = nn.Linear(n_heads * d_k, n_channels)
-        # Scale for dot-product attention
         self.scale = d_k ** -0.5
-        #
         self.n_heads = n_heads
         self.d_k = d_k
 
     def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None):
-        """
-        * `x` has shape `[batch_size, in_channels, height, width]`
-        * `t` has shape `[batch_size, time_channels]`
-        """
-        # `t` is not used, but it's kept in the arguments because for the attention layer function signature
-        # to match with `ResidualBlock`.
         _ = t
-        # Get shape
         batch_size, n_channels, height, width = x.shape
-        # Change `x` to shape `[batch_size, seq, n_channels]`
         x = x.view(batch_size, n_channels, -1).permute(0, 2, 1)
-        # Get query, key, and values (concatenated) and shape it to `[batch_size, seq, n_heads, 3 * d_k]`
         qkv = self.projection(x).view(
             batch_size, -1, self.n_heads, 3 * self.d_k)
-        # Split query, key, and values. Each of them will have shape `[batch_size, seq, n_heads, d_k]`
         q, k, v = torch.chunk(qkv, 3, dim=-1)
-        # Calculate scaled dot-product $\frac{Q K^\top}{\sqrt{d_k}}$
         attn = torch.einsum('bihd,bjhd->bijh', q, k) * self.scale
-        # Softmax along the sequence dimension $\underset{seq}{softmax}\Bigg(\frac{Q K^\top}{\sqrt{d_k}}\Bigg)$
         attn = attn.softmax(dim=2)
-        # Multiply by values
         res = torch.einsum('bijh,bjhd->bihd', attn, v)
-        # Reshape to `[batch_size, seq, n_heads * d_k]`
         res = res.reshape(batch_size, -1, self.n_heads * self.d_k)
-        # Transform to `[batch_size, seq, n_channels]`
         res = self.output(res)
-
-        # Add skip connection
         res += x
-
-        # Change to shape `[batch_size, in_channels, height, width]`
         res = res.permute(0, 2, 1).view(batch_size, n_channels, height, width)
-
-        #
         return res
 
 
-    
-
 class DownBlock(nn.Module):
-    """
-    ### Down block
-
-    This combines `ResidualBlock` and `AttentionBlock`. These are used in the first half of U-Net at each resolution.
-    """
-
     def __init__(self, in_channels: int, out_channels: int, time_channels: int, has_attn: bool):
         super().__init__()
         self.res = ResidualBlock(in_channels, out_channels, time_channels)
@@ -216,7 +150,7 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, time_channels: int, has_attn: bool):
         super().__init__()
-        # The input has `in_channels + out_channels` because we concatenate the output of the same resolution
+        # The input has in_channels + out_channels because we concatenate the output of the same resolution
         # from the first half of the U-Net
         self.res = ResidualBlock(
             in_channels + out_channels, out_channels, time_channels)
@@ -232,13 +166,6 @@ class UpBlock(nn.Module):
 
 
 class MiddleBlock(nn.Module):
-    """
-    ### Middle block
-
-    It combines a `ResidualBlock`, `AttentionBlock`, followed by another `ResidualBlock`.
-    This block is applied at the lowest resolution of the U-Net.
-    """
-
     def __init__(self, n_channels: int, time_channels: int):
         super().__init__()
         self.res1 = ResidualBlock(n_channels, n_channels, time_channels)
@@ -253,19 +180,12 @@ class MiddleBlock(nn.Module):
 
 
 class Upsample(nn.Module):
-    """
-    ### Scale up the feature map by $2 \times$
-    """
-
     def __init__(self, n_channels):
         super().__init__()
         self.conv = nn.ConvTranspose2d(
             n_channels, n_channels, (4, 4), (2, 2), (1, 1))
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, c):
-        # `t` is not used, but it's kept in the arguments because for the attention layer function signature
-        # to match with `ResidualBlock`.
-        _ = t
         return self.conv(x)
 
 
@@ -281,10 +201,6 @@ class Downsample(nn.Module):
 
 
 class UNet(nn.Module):
-    """
-    ## U-Net
-    """
-
     def __init__(self, image_channels: int = 3, n_channels: int = 64,
                  ch_mults: Union[Tuple[int, ...], List[int]] = (1, 2, 2, 4),
                  is_attn: Union[Tuple[bool, ...], List[bool]] = (
@@ -299,72 +215,45 @@ class UNet(nn.Module):
         * `n_blocks` is the number of `UpDownBlocks` at each resolution
         """
         super().__init__()
-
-        # Number of resolutions
         n_resolutions = len(ch_mults)
-
-        # Project image into feature map
         self.image_proj = nn.Conv2d(
             image_channels, n_channels, kernel_size=(3, 3), padding=(1, 1))
-
-        # Time embedding layer. Time embedding has `n_channels * 4` channels
         self.time_emb = TimeEmbedding(n_channels * 4)
-
-        # #### First half of U-Net - decreasing resolution
         down = []
-        # Number of channels
         out_channels = in_channels = n_channels
-        # For each resolution
         for i in range(n_resolutions):
-            # Number of output channels at this resolution
             out_channels = in_channels * ch_mults[i]
-            # Add `n_blocks`
             for _ in range(n_blocks):
                 down.append(DownBlock(in_channels, out_channels,
                             n_channels * 4, is_attn[i]))
                 in_channels = out_channels
-            # Down sample at all resolutions except the last
             if i < n_resolutions - 1:
                 down.append(Downsample(in_channels))
-
-        # Combine the set of modules
         self.down = nn.ModuleList(down)
-
-        # Middle block
         self.middle = MiddleBlock(out_channels, n_channels * 4, )
-
-        # #### Second half of U-Net - increasing resolution
         up = []
-        # Number of channels
         in_channels = out_channels
-        # For each resolution
         for i in reversed(range(n_resolutions)):
-            # `n_blocks` at the same resolution
             out_channels = in_channels
             for _ in range(n_blocks):
                 up.append(UpBlock(in_channels, out_channels,
                           n_channels * 4, is_attn[i]))
-            # Final block to reduce the number of channels
             out_channels = in_channels // ch_mults[i]
             up.append(UpBlock(in_channels, out_channels,
                       n_channels * 4, is_attn[i]))
             in_channels = out_channels
-            # Up sample at all resolutions except last
             if i > 0:
                 up.append(Upsample(in_channels))
-
-        # Combine the set of modules
         self.up = nn.ModuleList(up)
-
-        # Final normalization and convolution layer
         self.norm = nn.GroupNorm(8, n_channels)
         self.act = nn.SiLU()
         self.final = nn.Conv2d(in_channels, image_channels,
                                kernel_size=(3, 3), padding=(1, 1))
-        
+
         if ENABLE_CLASS_EMBEDDING:
             self.n_class = n_class
-            self.class_embedding_layer = ClassEmbedding(self.n_class, n_channels * 4)
+            self.class_embedding_layer = ClassEmbedding(
+                self.n_class, n_channels * 4)
 
     def forward(self, x: torch.Tensor, time_step: torch.Tensor, class_: torch.Tensor):
         """
@@ -372,40 +261,29 @@ class UNet(nn.Module):
         * `t` has shape `[batch_size]`
         class_ has shape (batch_size, )
         """
-
-        # Get time-step embeddings
         time_step_embedding = self.time_emb(time_step)
-
-        # Get image projection
         x = self.image_proj(x)
-
         class_embedding = torch.tensor([])
         if ENABLE_CLASS_EMBEDDING:
-            class_one_hot = nn.functional.one_hot(class_, num_classes=self.n_class).type(torch.float)
+            class_one_hot = nn.functional.one_hot(
+                class_, num_classes=self.n_class).type(torch.float)
             class_embedding = self.class_embedding_layer(class_one_hot)
 
-        # `h` will store outputs at each resolution for skip connection
         h = [x]
-        # First half of U-Net
         for m in self.down:
             x = m(x, time_step_embedding, class_embedding)
             h.append(x)
 
-        # Middle (bottom)
         x = self.middle(x, time_step_embedding, class_embedding)
 
-        # Second half of U-Net
         for m in self.up:
             if isinstance(m, Upsample):
                 x = m(x, time_step_embedding, class_embedding)
             else:
-                # Get the skip connection from first half of U-Net and concatenate
                 s = h.pop()
                 x = torch.cat((x, s), dim=1)
-                #
                 x = m(x, time_step_embedding, class_embedding)
 
-        # Final normalization and convolution
         return self.final(self.act(self.norm(x)))
 
 
@@ -418,9 +296,6 @@ class DenoiseDiffusion:
         """
         super().__init__()
         self.eps_model = eps_model
-
-        # Create $\beta_1, \dots, \beta_T$ linearly increasing variance schedule
-        # Cosine beta schedule
         def beta_at_t(t): return math.cos(
             (t + 0.008) / 1.008 * math.pi / 2) ** 2
         betas = []
@@ -434,13 +309,9 @@ class DenoiseDiffusion:
 
         self.device = device
 
-        # $\alpha_t = 1 - \beta_t$
         self.alpha = 1. - self.beta
-        # $\bar\alpha_t = \prod_{s=1}^t \alpha_s$
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-        # $T$
         self.n_diffusion_timestep = n_diffusion_timestep
-        # $\sigma^2 = \beta$
         self.sigma2 = self.beta
 
     def p_sample(self, xt: torch.Tensor, t: torch.Tensor, class_: torch.Tensor):
